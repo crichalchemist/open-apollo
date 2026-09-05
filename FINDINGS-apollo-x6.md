@@ -17,6 +17,12 @@ marked as such.
 | Device | Apollo x6 via UA Thunderbolt 3 Option Card |
 | PCI | `44:00.0` `1a00:0002`, subsystem `1a00:0014` |
 | Driver | `ua_apollo` v0.2.0, built from master at `53c86d0` |
+| Boot | Dual-boot; macOS on the same machine runs UA `UAD2System` 11.9.0 |
+
+The dual boot matters for reading the rest of this report: macOS had initialised the
+device before the Linux boot, so every measurement below is on a **warm** unit (the
+driver logs `mixer DSP alive! Skipping DMA reset to preserve state`). Cold behaviour
+is unverified throughout.
 
 The Thunderbolt device needed `boltctl enroll` before the PCIe tunnel appeared —
 with `security=user` and nothing auto-authorizing, `lspci` showed no `1a00` device
@@ -53,6 +59,32 @@ model.
 
 Practical consequence: an x6 is driven as an x8p — ring-connect path, x8p routing
 tables, 34/32 channel counts, 8 preamp strips.
+
+### The vendor's own driver names this unit an x6
+
+Cross-checked from macOS on the same iMac (dual boot), with no Linux driver in the
+path. `ioreg` shows the same node as the table above — `1a00:0002`, subsystem
+`0x0014` — and UA's own stack (`com.uaudio.driver.UAD2System` 11.9.0 build 389)
+names it. From `~/Library/Logs/Universal Audio/UAD Meter & Control Panel_0.log`,
+six occurrences, most recently `2026-09-05 11:27:30` (path elided for width):
+
+```
+UADMeterApp::LoadFirmwareUpdate updatePathName .../FirmwareUpdateRene_2.bin
+  unit 0 cardType Apollo x6 - HEXA requiresPowerCycle 1 isAudioDevice 1
+```
+
+`cardType` is a property of the enumerated unit, not part of the firmware filename,
+and `HEXA` agrees with the 6 DSPs read from `ext_caps[15:8]` above.
+
+**This settles the identification.** The model is not inferred from chassis
+inspection alone: the vendor's own driver, reading this hardware behind subsystem
+`0x0014`, calls it an Apollo x6. That falsifies the specific `0x0014` → x8p mapping
+at `ua_core.c:214-221` by counterexample.
+
+It does not by itself prove `0x0014` is a *platform* ID. That conclusion needs a
+real x8p to report `0x0014` too — which `devices/apollo-x8p.json` asserts, on a unit
+verified as an x8p by its 8 discrete preamps (issue #52), but which this session did
+not measure. Open question 4 stands.
 
 ### The serial is readable — but only after connect
 
@@ -310,10 +342,13 @@ nothing routed, rather than nothing plugged in.
 Two contributing facts:
 
 1. `ua_dsp_send_routing()` is reachable **only** via `UA_IOCTL_SEND_ROUTING`
-   (`ua_core.c:2134-2141`). Nothing calls it at probe or connect, so a plain `insmod`
-   never sends a routing table. However, this is not the cause: the descriptors it
-   would write are byte-identical to what the hardware already reports, so sending
-   them is a content no-op.
+   (`ua_core.c:2134-2141`). Declared at `ua_apollo.h:989`, defined at
+   `ua_dsp.c:3165`, and `ua_core.c:2138` is its **sole call site in the tree** —
+   `grep -rn ua_dsp_send_routing driver/` returns those three plus one comment
+   (`ua_routing.h:522`) and nothing else. So nothing reaches it at probe or connect,
+   and a plain `insmod` never sends a routing table. However, this is not the cause:
+   the descriptors it would write are byte-identical to what the hardware already
+   reports, so sending them is a content no-op.
 2. The plugin chain carries **284 ROUTING and 745 BUS_COEFF** commands (Finding 7) and
    never ran, because the firmware blob is absent and the guard at `ua_dsp.c:2500`
    correctly refuses to send a partial chain. Without those, the DSP mixer has no input
@@ -355,6 +390,41 @@ succeeds on stream open.
    `ua_audio.c:1165-1185`.
 7. Read clock source and features from `0xC090` instead of hardcoding/guessing.
 8. Clear the stale comments and descriptor fields listed in Finding 5.
+
+### Correcting detection is not safe on its own
+
+Changes 1, 2 and 2b move this unit from `device_type` `0x20` to `0x1E`. Nothing in
+the tree is ready for `0x1E`: the unit works today only because misdetection lands
+it on x8p-shaped defaults that happen to fit. Four sites must change together.
+
+| # | Site | Today (as x8p `0x20`) | After the fix (x6 `0x1E`) |
+|---|---|---|---|
+| 1 | `ua_audio.c:90` `ua_models[]` | 34 play / 32 rec | **24 / 22** |
+| 2 | same row | 8 preamps | **4** (chassis has 2) |
+| 3 | `ua_routing.h:1051` `ua_get_routing_config()` | `&ua_x8p_routing_config` | **`NULL`** |
+| 4 | `mixer-engine/device_maps/` | `device_map_apollo_x8p.json` | **none — falls back to x4** |
+
+1. **Channel counts.** `ua_audio.c:117-122` programs `play_channels`/`rec_channels`
+   straight from `ua_models[]`. Record drops 32 → 22, so capture `AUX26/AUX27` — the
+   loopback pair verified at −8.2 dBFS above — ceases to exist. That invalidates the
+   verified capture path and silently drops 10 record channels; playback on
+   `AUX0/AUX1` (MON L/R) likely survives, since `d2d10bb` describes the old 26/26 as
+   *hiding* channels rather than failing. The x6 row's `24, 22` cites nothing. This
+   unit measures 34/32 and `d2d10bb` measured 34/32 on an independent x8p, so the
+   count looks platform-wide — consistent with Finding 1.
+2. **Preamp count** — suggested change 4 above. `4` is as wrong as `8` for this unit.
+3. **Routing config.** `ua_get_routing_config()` has cases for X4 and X8P only; X6
+   falls to `default: return NULL` (`ua_routing.h:1058`). Latent rather than
+   immediate — no routing table is sent today anyway, since `ua_dsp_send_routing()`
+   is reachable only via `UA_IOCTL_SEND_ROUTING` (`ua_core.c:2134-2141`) — but the
+   config would go from available to absent, closing off the fix for that path.
+4. **Device map.** `lookup_device(0x1E)` returns `("Apollo x6", None)`, so
+   `find_device_map()` logs *"falling back to Apollo x4"* and loads the 4-preamp x4
+   map (`ua_mixer_daemon.py:1515-1535`). The control surface moves from 8 strips to
+   4; neither fits this chassis.
+
+Landing the detection fix by itself regresses a device that currently passes audio
+in both directions.
 
 ## Build warnings (pre-existing, GCC 13.3.0, kernel 6.8.0-139)
 

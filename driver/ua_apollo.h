@@ -36,7 +36,16 @@
 #define UA_SUBSYS_APOLLO_X4_QUAD        0x0011
 #define UA_SUBSYS_APOLLO_SOLO           0x000F
 #define UA_SUBSYS_APOLLO_8P             0x0006
-#define UA_SUBSYS_APOLLO_X8P            0x0014  /* x8p: serial 2008xxxx false-matches "2017"->x8; 6 DSPs, FPGA 0xa241c5ac */
+/*
+ * 0x0014 is a PLATFORM id, not a model id.  The Apollo x6 and x8p are
+ * indistinguishable on it: same subsystem, same FPGA revision
+ * (0xa241c5ac), same 6 DSPs, same name string at 0xC034, and
+ * byte-identical IO descriptors in both directions.  The serial is the
+ * only signal that separates them -- x6 reads "2019" at digits 5-8, x8p
+ * reads "2017" -- and it reads 0xff until after connect.  Resolve with
+ * ua_platform_hexa_type(), never by subsystem ID alone.
+ */
+#define UA_SUBSYS_PLATFORM_HEXA         0x0014
 
 /*
  * UAD2DeviceType enum — reconstructed from CPcieDevice::Name() and
@@ -939,6 +948,7 @@ static inline void ua_disable_vector(struct ua_device *ua, unsigned int vector)
 
 /* Audio subsystem interface (ua_audio.c) */
 int ua_audio_preinit_dma(struct ua_device *ua);
+void ua_audio_remodel(struct ua_device *ua);
 int ua_audio_init(struct ua_device *ua);
 void ua_audio_fini(struct ua_device *ua);
 void ua_audio_irq(struct ua_device *ua, u32 status_lo, u32 status_hi);

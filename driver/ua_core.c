@@ -215,9 +215,16 @@ static void ua_detect_capabilities(struct ua_device *ua)
 		case UA_SUBSYS_APOLLO_8P:
 			ua->device_type = UA_DEV_APOLLO_8P;
 			break;
-		case UA_SUBSYS_APOLLO_X8P:
-			/* x8p serial "2008xxxx" false-matches "2017"->x8 in the
-			 * serial table; pin it by subsystem ID (0x0014) instead. */
+		case UA_SUBSYS_PLATFORM_HEXA:
+			/*
+			 * Platform 0x0014 carries both the x6 and the x8p,
+			 * and the serial that separates them still reads
+			 * 0xff here -- no initialisation has run between
+			 * the BAR ioremap and this point.  Take the x8p
+			 * provisionally so bring-up is byte-for-byte what
+			 * shipped, then refine from the serial once connect
+			 * has populated it (ua_refine_platform_model()).
+			 */
 			ua->device_type = UA_DEV_APOLLO_X8P;
 			break;
 		case UA_SUBSYS_APOLLO_SOLO:
@@ -247,7 +254,10 @@ static const struct ua_serial_entry ua_serial_table[] = {
 	{ "2016", UA_DEV_APOLLO_X6 },
 	{ "2017", UA_DEV_APOLLO_X8 },
 	{ "2018", UA_DEV_APOLLO_X16 },
-	{ "2019", UA_DEV_APOLLO_X8P },
+	/* 2019 is an x6, not an x8p: UA's own UAD2System 11.9.0 names
+	 * serial 2048 2019 011389 "Apollo x6 - HEXA".  The x8p reads
+	 * 2017 at digits 5-8 (see ua_platform_hexa_type()). */
+	{ "2019", UA_DEV_APOLLO_X6 },
 	{ "2020", UA_DEV_APOLLO_TWIN_X },
 	{ "2024", UA_DEV_APOLLO_SOLO },
 	{ "2025", UA_DEV_ARROW },
@@ -316,6 +326,80 @@ const char *ua_device_name(u32 device_type)
 	case UA_DEV_APOLLO_TWIN_X_GEN2:	return "Apollo Twin X Gen 2";
 	default:			return "Unknown UA Device";
 	}
+}
+
+/*
+ * Resolve a platform-0x0014 unit (x6 or x8p) from its serial.
+ *
+ * Scoped to this platform deliberately.  "2017" also appears in
+ * ua_serial_table as the Apollo x8, which is a different platform, so an
+ * unscoped lookup resolves every x8p to an x8 -- that false match is the
+ * reason the subsystem pin existed in the first place.  Returns 0 if the
+ * serial names neither model.
+ */
+static u32 ua_platform_hexa_type(const char *serial)
+{
+	if (!strncmp(serial + 4, "2019", 4))
+		return UA_DEV_APOLLO_X6;
+	if (!strncmp(serial + 4, "2017", 4))
+		return UA_DEV_APOLLO_X8P;
+	return 0;
+}
+
+/*
+ * Re-resolve the model once the serial is readable.
+ *
+ * ua_detect_capabilities() runs immediately after the BAR ioremap, where
+ * BAR0+0x20..0x2F still reads all 0xff; the serial only appears after
+ * connect.  On platform 0x0014 the serial is the sole signal separating an
+ * x6 from an x8p, so the model assigned at probe is provisional.
+ *
+ * Call this after ua_dsp_init_and_load() and before ua_audio_init().  By
+ * then the bring-up mechanism ua_uses_audio_extension() selected has
+ * already run -- four of its five call sites are inside
+ * ua_dsp_init_and_load() -- so correcting the model here cannot change how
+ * the device was brought up.  It only fixes the identity that
+ * ua_audio_init() (channel and preamp counts), the routing config lookup
+ * and userspace go on to consume.
+ */
+static void ua_refine_platform_model(struct ua_device *ua)
+{
+	char serial[UA_REG_SERIAL_LEN + 1];
+	u32 regs[4];
+	u32 type;
+	int i;
+
+	if (ua->subsystem_id != UA_SUBSYS_PLATFORM_HEXA)
+		return;
+
+	for (i = 0; i < 4; i++)
+		regs[i] = ua_read(ua, UA_REG_SERIAL_BASE + i * 4);
+
+	memcpy(serial, regs, UA_REG_SERIAL_LEN);
+	serial[UA_REG_SERIAL_LEN] = '\0';
+
+	type = ua_platform_hexa_type(serial);
+	if (!type) {
+		dev_warn(&ua->pdev->dev,
+			 "platform 0x0014: serial %.16s names no known model, keeping %s\n",
+			 serial, ua_device_name(ua->device_type));
+		return;
+	}
+
+	if (type == ua->device_type)
+		return;
+
+	dev_info(&ua->pdev->dev, "model refined from serial %.16s: %s -> %s\n",
+		 serial, ua_device_name(ua->device_type),
+		 ua_device_name(type));
+	ua->device_type = type;
+
+	/*
+	 * Channel and preamp counts were latched for the provisional
+	 * model by ua_audio_preinit_dma(); re-derive them so the
+	 * corrected model is the one ALSA registers.
+	 */
+	ua_audio_remodel(ua);
 }
 
 /*
@@ -2770,6 +2854,13 @@ static int ua_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	ret = ua_dsp_init_and_load(ua);
 	if (ret)
 		goto err_free_irq;
+
+	/*
+	 * Connect has run, so the serial is readable now.  Correct the
+	 * model before ua_audio_init() reads channel and preamp counts
+	 * from it.
+	 */
+	ua_refine_platform_model(ua);
 
 	/* Create character device /dev/ua_apolloN */
 	devno = ida_alloc_max(&ua_ida, UA_MAX_DEVICES - 1, GFP_KERNEL);

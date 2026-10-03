@@ -1039,6 +1039,42 @@ static const struct ua_routing_config ua_x8p_routing_config = {
 	.io_desc_output  = ua_x8p_io_desc_output,
 };
 
+/*
+ * ============================================================================
+ * Apollo x6 (device_type 0x1E)
+ * ============================================================================
+ *
+ * The x6 shares platform 0x0014 with the x8p and reports the *same* IO
+ * descriptors: all 86 entries in both directions read back byte-identical
+ * between an x6 (serial 2048 2019 011389) and the x8p the block above was
+ * captured from.  They are reused here rather than duplicated, because they
+ * are a property of the platform, not of either SKU.
+ *
+ * A consequence worth stating: the descriptors overstate this chassis.  The
+ * x6 reports LINE 5-8 inputs and LINE 1-8 outputs for which it has no
+ * connectors, so neither analog fitment nor preamp count can be derived from
+ * them -- ua_models[] in ua_audio.c carries the physical counts instead.
+ *
+ * No routing tables.  Those come from SEL171 payloads captured during a UAD
+ * Console session, which has not been done on an x6; .rec_table/.play_table
+ * stay NULL.  Only io_desc_input/io_desc_output are consumed by the driver
+ * today (ua_dsp_send_routing), so this config is complete for every path
+ * that currently reads it.
+ *
+ * Channel counts are the DMA fabric counts, reconciled from the descriptors:
+ * input 34 - S/PDIF 2 = 32 record, output 52 - S/PDIF 2 - 16 unnamed group
+ * 0x0c = 34 playback.  Capture arriving on AUX26/AUX27 confirms record
+ * extends past 22.
+ */
+static const struct ua_routing_config ua_x6_routing_config = {
+	.rec_channels   = 32,
+	.play_channels   = 34,
+	.rec_names       = ua_x8p_rec_names,
+	.play_names      = ua_x8p_play_names,
+	.io_desc_input   = ua_x8p_io_desc_input,
+	.io_desc_output  = ua_x8p_io_desc_output,
+};
+
 
 /*
  * ua_get_routing_config - Return routing config for a given device type.
@@ -1055,6 +1091,8 @@ ua_get_routing_config(u32 device_type)
 		return &ua_x4_routing_config;
 	case UA_DEV_APOLLO_X8P:
 		return &ua_x8p_routing_config;
+	case UA_DEV_APOLLO_X6:
+		return &ua_x6_routing_config;
 	default:
 		return NULL;
 	}

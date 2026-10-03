@@ -87,7 +87,17 @@ static const struct ua_model_info ua_models[] = {
 	{ UA_DEV_APOLLO_TWIN_X_GEN2,   8,  8,  2, 2 },
 	{ UA_DEV_APOLLO_X4,           24, 22,  4, 2 },
 	{ UA_DEV_APOLLO_X4_GEN2,     24, 22,  4, 2 },
-	{ UA_DEV_APOLLO_X6,           24, 22,  4, 2 },
+	/*
+	 * x6: 34/32 from the IO descriptors read back on a live unit
+	 * (SRAM 0xC1A4/0xC2C4): input 34 - S/PDIF 2 = 32 record, output
+	 * 52 - S/PDIF 2 - 16 unnamed group 0x0c = 34 playback.  Confirmed
+	 * by capture arriving on AUX26/AUX27, which cannot exist if the
+	 * unit had 22 record channels.  The 2 preamps are the physical
+	 * count on the chassis -- the input descriptor is a platform
+	 * constant and overstates analog fitment, so it cannot be used
+	 * to derive this.  Verified on serial 2048 2019 011389.
+	 */
+	{ UA_DEV_APOLLO_X6,           34, 32,  2, 2 },
 	{ UA_DEV_APOLLO_X6_GEN2,     24, 22,  4, 2 },
 	{ UA_DEV_APOLLO_X8,           26, 26,  4, 2 },
 	{ UA_DEV_APOLLO_X8_GEN2,     26, 26,  4, 2 },
@@ -360,6 +370,47 @@ static void ua_audio_program_sg(struct ua_device *ua)
  *
  * Safe to call multiple times — skips allocation if already done.
  */
+/*
+ * Re-derive model-dependent audio parameters after a late model correction.
+ *
+ * ua_audio_preinit_dma() latches channel and preamp counts for the model
+ * known at probe, and ua_audio_init() keeps whatever it finds there
+ * (it only derives them when play_channels is still zero).  When
+ * ua_refine_platform_model() corrects the model after connect -- the
+ * earliest point the serial is readable -- those latched values are stale.
+ *
+ * DMA buffers are already sized from the provisional counts by the time
+ * this runs, so a change in play/rec cannot be applied safely here: it is
+ * reported and the original counts kept.  Preamp counts are not consumed
+ * until ALSA control registration, so they always take effect.
+ */
+void ua_audio_remodel(struct ua_device *ua)
+{
+	struct ua_audio *audio = &ua->audio;
+	unsigned int old_play = audio->play_channels;
+	unsigned int old_rec = audio->rec_channels;
+
+	ua_get_model_channels(ua);
+
+	if (!old_play)
+		return;		/* nothing latched yet -- new values stand */
+
+	if (audio->play_channels != old_play ||
+	    audio->rec_channels != old_rec) {
+		dev_warn(&ua->pdev->dev,
+			 "model correction wants %u/%u channels but DMA is already sized for %u/%u; keeping %u/%u\n",
+			 audio->play_channels, audio->rec_channels,
+			 old_play, old_rec, old_play, old_rec);
+		audio->play_channels = old_play;
+		audio->rec_channels = old_rec;
+	}
+
+	dev_info(&ua->pdev->dev,
+		 "audio remodelled: %u play, %u rec, %u preamps, %u hiz\n",
+		 audio->play_channels, audio->rec_channels,
+		 audio->num_preamps, audio->num_hiz);
+}
+
 int ua_audio_preinit_dma(struct ua_device *ua)
 {
 	struct ua_audio *audio = &ua->audio;

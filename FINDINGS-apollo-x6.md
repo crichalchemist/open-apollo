@@ -23,7 +23,8 @@ The dual boot matters for reading the rest of this report: macOS had initialised
 device before the Linux boot, so every measurement below is on a **warm** unit (the
 driver logs `mixer DSP alive! Skipping DMA reset to preserve state`). Cold behaviour
 was unverified throughout when this report was first written; it has since been
-measured once, and it fails -- see *Cold bring-up fails on this platform* below.
+measured, and it is the warm reloads that fail, not the cold start —
+see *The device grants one AudioExtension connect per power-on* below.
 
 The Thunderbolt device needed `boltctl enroll` before the PCIe tunnel appeared —
 with `security=user` and nothing auto-authorizing, `lspci` showed no `1a00` device
@@ -373,9 +374,11 @@ succeeds on stream open.
 3. What is output group `0x0c`, indices 1-16? Unnamed in both the descriptor and the
    device's own routing table.
 4. Does a real Apollo x8p also report subsystem `0x0014` and FPGA `0xa241c5ac`?
-5. Why does ACEFACE time out on a cold unit, and what does macOS do differently
-   before its first connect? Every working measurement here was on a unit macOS
-   had already initialised.
+5. Why does the device grant only one AudioExtension connect per power-on? The
+   unload path explains the reload case, but not the 2026-10-03 10:59:18 timeout,
+   which happened inside a live probe with `aceface_done` already true.
+6. Does macOS hit the same limit, or does `UAD2System` issue a disconnect the Linux
+   driver omits? A DTrace of a Console restart would answer it.
 
 ## Suggested changes
 
@@ -430,50 +433,100 @@ it on x8p-shaped defaults that happen to fit. Four sites must change together.
 Landing the detection fix by itself regresses a device that currently passes audio
 in both directions.
 
-## Cold bring-up fails on this platform — independent of detection
+## The device grants one AudioExtension connect per power-on
 
-Every other measurement in this report was taken on a warm unit. On a cold one the
-driver does not connect at all:
+An earlier revision of this section claimed that cold bring-up fails on this
+platform. That was wrong, and the correction is the more useful finding: the cold
+start is the *only* bring-up that works. Every `ua_apollo` load that reuses an
+already-enumerated device fails its AudioExtension handshake, whatever the module
+contains.
 
+Stated precisely: **the device grants exactly one AudioExtension connect per
+power-on.** Reconstructed from `journalctl -k` over seven days — three power-on
+cycles and ten `ua_audio_connect()` attempts across them:
+
+| Attempt, counting from the device powering on | Attempts | Result |
+|---|---|---|
+| 1st after a fresh PCI enumeration | 3 | `audio extension connected`, every time |
+| 2nd and later | 7 | `audio extension connect timeout`, `-110`, every time |
+
+No counterexample in either direction. A module reload is not required to lose the
+grant: on 2026-10-03 a connect succeeded at 10:58:57 and a second attempt timed out
+at 10:59:18 within the *same* probe — the `v0.2.0` banner, which `module_init()`
+prints only after `pci_register_driver()` returns, comes after the timeout, and the
+DSP service loop logged ~400 cycles in between. Reloading is just the usual way a
+second attempt happens, not the cause.
+
+The runs span both the pre-fix module (`9ad3595`) and the post-fix one (`78a634d`),
+and the attempt index predicts the outcome in all ten cases while the module version
+predicts nothing. So a `-110` here is not evidence about whatever changed most
+recently in the driver.
+
+The failure is not quiet, but its *consequences* look like something else entirely:
+the ALSA card still registers and the model still resolves correctly, so
+`/proc/asound/cards` lists `Apollo x6` and everything appears present. The PCM
+cannot open — `arecord` fails at `set_params` on 32 channels — so WirePlumber
+creates no sink and no source and the device vanishes from PipeWire. That presents
+as "the driver broke my audio" rather than "firmware never connected".
+
+### Why the second attempt cannot connect — across a reload
+
+The unload path leaves the AudioExtension connected in hardware. When the mixer DSP
+is alive, `ua_audio_disconnect()` deliberately takes a soft path that never writes
+`UA_AX_DISCONNECT`:
+
+```c
+/* driver/ua_audio.c:1299 */
+seq_wr = ua_read(ua, UA_REG_MIXER_SEQ_WR);
+seq_rd = ua_read(ua, UA_REG_MIXER_SEQ_RD);
+if (seq_rd > 0 && seq_rd == seq_wr) {
+	dev_info(&ua->pdev->dev,
+		 "audio extension soft-disconnect (preserving mixer DSP)\n");
+} else {
+	ua_write(ua, UA_REG_AX_CONNECT, UA_AX_DISCONNECT);
+	...
+}
 ```
-ua_apollo 0000:44:00.0: ACEFACE connect: writing 0x0aceface to 0xc02c, polling 0xc030
-ua_apollo 0000:44:00.0: audio extension connect timeout
-ua_apollo 0000:44:00.0: early firmware connect failed (-110), will retry on stream open
-```
 
-The timeout is ~20.8 s. The failure is not quiet, but its *consequences* look like
-something else entirely: the ALSA card still registers and the model still resolves
-correctly, so `/proc/asound/cards` lists `Apollo x6` and everything appears present.
-The PCM cannot open — `arecord` fails at `set_params` on 32 channels — so
-WirePlumber creates no sink and no source and the device vanishes from PipeWire.
-That presents as "the driver broke my audio" rather than "firmware never connected".
+The driver's only "already connected, skip the handshake" shortcut is at
+`ua_audio.c:919`, and it is gated on `ua->aceface_done` — a `bool` inside
+`struct ua_device`, freed with the module. The next load therefore believes it is
+starting cold: it writes `0x0aceface` to `0xC02C` and the connect doorbell to
+`0x2260`, both into an AudioExtension that is already connected, then polls `0xC030`
+for a notification the firmware has no reason to raise again. 20.8 s later it gives
+up with `-110`. The successful path also ends by zeroing `0xC030`, so the previous
+load has already cleared the one bit the next one is waiting on.
 
-**This predates the detection work.** Measured by loading both modules back to back
-on the same cold unit, minutes apart:
+The state is self-perpetuating. After a failed connect `audio->connected` is false,
+so the following unload never reaches the disconnect path and clears nothing — which
+is why three consecutive reloads on 2026-10-03 (13:23:33, 13:24:01, 13:24:29) each
+timed out in turn. Only re-enumeration resets it; in every observed case that meant
+mains power to the Apollo, which is what the driver's own `early ACEFACE timed out —
+power-cycle Apollo to connect` at `ua_audio.c:697` is pointing at.
 
-| Module | Result |
-|---|---|
-| `9ad3595` (before the x6 detection fix) | `audio extension connect timeout`, `-110` |
-| `78a634d` (with it) | `audio extension connect timeout`, `-110` |
+This accounts for the reload case and not the within-probe one. At 10:59:18 the
+module was live and `ua->aceface_done` had been set true by the connect 21 s
+earlier, so the shortcut at `ua_audio.c:919` should have skipped the handshake
+entirely — nothing in the tree assigns `aceface_done = false` after init. Whatever
+reached the retry loop that second time took a path not identified here. The
+empirical law holds across all ten attempts either way; the explanation covers only
+the six failures that follow an unload.
 
-Same register, same timeout, same error. The A run also settles a plausible-looking
-theory that is wrong: it logs `ACEFACE connect` while the unit is still being
-detected as an x8p, so the AudioExtension handshake is *not* gated on the model.
-`ua_audio_connect()` calls `ua_aceface_handshake()` unconditionally, and the
-`ua_uses_audio_extension()` check at `ua_core.c:2488` guards only a *retry* after
-firmware load. A detection change therefore cannot cause or cure this.
+### Consequences
 
-Recovery is a mains power-cycle of the unit, not a Thunderbolt replug — the driver
-says so itself at `ua_audio.c:646` (`early ACEFACE timed out — power-cycle Apollo
-to connect`). Repeated `rmmod`/`insmod` cycles appear to be what drives the DSP into
-this state; it had connected earlier in the same boot.
+Diagnosis first: before attributing a `-110` to code, check `journalctl -k` for
+whether the device re-enumerated since the last load. The pre-fix and post-fix
+modules are indistinguishable on this axis, and an A/B that loads them back to back
+puts the second one in the losing position by construction — that is exactly how
+this was misread the first time.
 
-Two consequences for anyone reading this report as a basis for a patch. First, a
-device that passes audio here does so on a warm DSP, and nothing in this report
-should be read as evidence that cold bring-up works. Second, if the detection fix
-lands and someone then hits `-110`, the fix is not the cause; this table is the
-reason to believe that.
-
+Then the cost: every rebuild needs a power-cycle before it can be tested against
+audio, which makes driver iteration slow enough to distort what gets tested. Worth
+fixing on its own, independently of the x6 work. Two candidates — have the probe
+path detect an AudioExtension that is already connected and skip to
+`post_handshake`, or write `UA_AX_DISCONNECT` unconditionally on unload. Neither
+sequence is captured from a working driver yet, so both need a trace before they go
+in.
 ## Build warnings (pre-existing, GCC 13.3.0, kernel 6.8.0-139)
 
 ```

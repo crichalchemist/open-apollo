@@ -22,7 +22,8 @@ marked as such.
 The dual boot matters for reading the rest of this report: macOS had initialised the
 device before the Linux boot, so every measurement below is on a **warm** unit (the
 driver logs `mixer DSP alive! Skipping DMA reset to preserve state`). Cold behaviour
-is unverified throughout.
+was unverified throughout when this report was first written; it has since been
+measured once, and it fails -- see *Cold bring-up fails on this platform* below.
 
 The Thunderbolt device needed `boltctl enroll` before the PCIe tunnel appeared —
 with `security=user` and nothing auto-authorizing, `lspci` showed no `1a00` device
@@ -372,6 +373,9 @@ succeeds on stream open.
 3. What is output group `0x0c`, indices 1-16? Unnamed in both the descriptor and the
    device's own routing table.
 4. Does a real Apollo x8p also report subsystem `0x0014` and FPGA `0xa241c5ac`?
+5. Why does ACEFACE time out on a cold unit, and what does macOS do differently
+   before its first connect? Every working measurement here was on a unit macOS
+   had already initialised.
 
 ## Suggested changes
 
@@ -425,6 +429,50 @@ it on x8p-shaped defaults that happen to fit. Four sites must change together.
 
 Landing the detection fix by itself regresses a device that currently passes audio
 in both directions.
+
+## Cold bring-up fails on this platform — independent of detection
+
+Every other measurement in this report was taken on a warm unit. On a cold one the
+driver does not connect at all:
+
+```
+ua_apollo 0000:44:00.0: ACEFACE connect: writing 0x0aceface to 0xc02c, polling 0xc030
+ua_apollo 0000:44:00.0: audio extension connect timeout
+ua_apollo 0000:44:00.0: early firmware connect failed (-110), will retry on stream open
+```
+
+The timeout is ~20.8 s. The failure is not quiet, but its *consequences* look like
+something else entirely: the ALSA card still registers and the model still resolves
+correctly, so `/proc/asound/cards` lists `Apollo x6` and everything appears present.
+The PCM cannot open — `arecord` fails at `set_params` on 32 channels — so
+WirePlumber creates no sink and no source and the device vanishes from PipeWire.
+That presents as "the driver broke my audio" rather than "firmware never connected".
+
+**This predates the detection work.** Measured by loading both modules back to back
+on the same cold unit, minutes apart:
+
+| Module | Result |
+|---|---|
+| `9ad3595` (before the x6 detection fix) | `audio extension connect timeout`, `-110` |
+| `78a634d` (with it) | `audio extension connect timeout`, `-110` |
+
+Same register, same timeout, same error. The A run also settles a plausible-looking
+theory that is wrong: it logs `ACEFACE connect` while the unit is still being
+detected as an x8p, so the AudioExtension handshake is *not* gated on the model.
+`ua_audio_connect()` calls `ua_aceface_handshake()` unconditionally, and the
+`ua_uses_audio_extension()` check at `ua_core.c:2488` guards only a *retry* after
+firmware load. A detection change therefore cannot cause or cure this.
+
+Recovery is a mains power-cycle of the unit, not a Thunderbolt replug — the driver
+says so itself at `ua_audio.c:646` (`early ACEFACE timed out — power-cycle Apollo
+to connect`). Repeated `rmmod`/`insmod` cycles appear to be what drives the DSP into
+this state; it had connected earlier in the same boot.
+
+Two consequences for anyone reading this report as a basis for a patch. First, a
+device that passes audio here does so on a warm DSP, and nothing in this report
+should be read as evidence that cold bring-up works. Second, if the detection fix
+lands and someone then hits `-110`, the fix is not the cause; this table is the
+reason to believe that.
 
 ## Build warnings (pre-existing, GCC 13.3.0, kernel 6.8.0-139)
 

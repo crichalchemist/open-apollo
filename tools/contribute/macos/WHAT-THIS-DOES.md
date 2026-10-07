@@ -62,10 +62,13 @@ selectors:
 These are the same calls the UA software makes during normal operation. The
 DTrace probes only observe — they do not inject, modify, or replay any calls.
 
-Note that the routing table is sent when Console attaches to the device, not
-continuously. If Console is already running and idle for the whole capture
-window, the result will be empty — quit and relaunch Console while the capture
-is running.
+Note that the routing table is sent when the device is programmed, not
+continuously. If Console sits idle for the whole capture window, the result will
+be empty. To emit the payloads, change the sample rate in the Console footer bar
+during the window (e.g. 44.1k to 48k), wait a few seconds, then change it back.
+
+Do **not** quit Console to force a re-attach. DTrace is attached to the mixer
+engine process, so quitting Console ends the capture instead of triggering one.
 
 ## What this does NOT do
 
